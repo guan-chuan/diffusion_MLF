@@ -163,8 +163,10 @@ class ResBlock(nn.Module):
     def forward(self, x, t_emb, cond_emb=None):
         h = self.norm1(x)
         h = self.act(self.fc1(h))
-        bias = self.time_proj(t_emb).unsqueeze(1) if t_emb is not None else 0.0
-        if cond_emb is not None:
+        # Apply time embedding
+        bias = self.time_proj(t_emb).unsqueeze(1)
+        # Apply condition embedding if present
+        if cond_emb is not None and self.cond_proj is not None:
             bias = bias + self.cond_proj(cond_emb).unsqueeze(1)
         h = h + bias
         h = self.norm2(h)
@@ -180,12 +182,12 @@ class NoAttentionTransformerBlock(nn.Module):
         self.fc2 = nn.Linear(dim*4, dim)
         self.norm2 = nn.LayerNorm(dim)
     def forward(self, x, mask=None):
-        if mask is not None:
-            x = x * mask.unsqueeze(-1).float()
+        # Apply mask to residual block output, not to input
         h = self.norm1(x)
         h = self.act(self.fc1(h))
         h = self.fc2(h)
         h = self.norm2(h)
+        # Apply mask only to the new residual contribution
         if mask is not None:
             h = h * mask.unsqueeze(-1).float()
         return x + h
@@ -209,13 +211,21 @@ class EnhancedDiffusionUNet(nn.Module):
         self.thickness_head = nn.Linear(hidden_dim, 1)
     def forward(self, mat_noisy, thk_noisy, timesteps, cond_emb, layer_mask, drop_mask=None):
         B,L,V = mat_noisy.shape
-        # cond per-sample mask handled by caller (drop_mask boolean vector)
+        # cond per-sample mask: True means drop condition, False means keep condition
+        # If drop_mask[i] is True, set cond_emb[i] to zeros for that sample
         t_emb = sinusoidal_time_embedding(timesteps, dim=128).to(mat_noisy.device)
+        
+        # Apply per-sample condition dropping for classifier-free guidance
+        cond_emb_masked = cond_emb.clone() if cond_emb is not None else None
+        if drop_mask is not None and cond_emb_masked is not None:
+            # drop_mask: (B,) boolean tensor, True means drop condition
+            cond_emb_masked = cond_emb_masked * (~drop_mask).float().unsqueeze(-1)
+        
         x = torch.cat([mat_noisy, thk_noisy], dim=-1)
         x = self.initial(x)
-        x = self.res1(x, t_emb, cond_emb)
+        x = self.res1(x, t_emb, cond_emb_masked)
         x = self.trans(x, mask=layer_mask)
-        x = self.res2(x, t_emb, cond_emb)
+        x = self.res2(x, t_emb, cond_emb_masked)
         x = self.final_norm(x)
         mat_noise = self.material_head(x)
         thk_noise = self.thickness_head(x)
@@ -342,7 +352,18 @@ class EnhancedDiffusionModel:
         self.spectrum_dim = ds.S
         self.model = EnhancedDiffusionUNet(self.layer_count, self.vocab_size, hidden_dim=256).to(self.device)
         self.pnn_wrapper = PNNSurrogateWrapper(pnn_path, device=self.device) if pnn_path else None
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+        
+        # Create spectrum encoder as a proper model component (trainable)
+        self.spec_encoder = nn.Sequential(
+            nn.LayerNorm(ds.S * 2),
+            nn.Linear(ds.S * 2, 256),
+            nn.SiLU(),
+            nn.Linear(256, 128)
+        ).to(self.device)
+        
+        # Optimizer includes both model and spectrum encoder parameters
+        model_params = list(self.model.parameters()) + list(self.spec_encoder.parameters())
+        self.optimizer = torch.optim.AdamW(model_params, lr=1e-4)
         self.ema = {n: p.detach().clone() for n,p in self.model.named_parameters() if p.requires_grad}
         self.ema_decay = 0.9999
         # hyperparams
@@ -352,17 +373,9 @@ class EnhancedDiffusionModel:
         self.guidance_w = 6.0
 
     def _encode_spectrum(self, spectra):
-        # small MLP cond encoder (trainable)
-        # Expect spectra shape (B, 2S) or (B, S) depending on usage
-        B = spectra.shape[0]
-        if not hasattr(self, '_spec_encoder'):
-            self._spec_encoder = nn.Sequential(
-                nn.LayerNorm(spectra.shape[-1]),
-                nn.Linear(spectra.shape[-1], 256),
-                nn.SiLU(),
-                nn.Linear(256, 128)
-            ).to(self.device)
-        return self._spec_encoder(spectra.to(self.device))
+        # Encode spectrum using trainable spectrum encoder
+        # Expect spectra shape (B, 2S) where first S is transmission, second S is reflection
+        return self.spec_encoder(spectra.to(self.device))
 
     def _update_ema(self):
         for n,p in self.model.named_parameters():
@@ -569,8 +582,13 @@ class EnhancedDiffusionModel:
 
         for t in range(self.scheduler.timesteps, 0, -1):
             t_tensor = torch.full((B,), t, dtype=torch.long, device=device)
-            eps_cond_mat, eps_cond_thk = self.model(x, x_thk, t_tensor, cond_emb, layer_mask, drop_mask=None)
-            eps_uncond_mat, eps_uncond_thk = self.model(x, x_thk, t_tensor, cond_emb*0.0, layer_mask, drop_mask=None)
+            # For CFG: get predictions with condition
+            drop_mask_cond = torch.zeros(B, dtype=torch.bool, device=device)
+            eps_cond_mat, eps_cond_thk = self.model(x, x_thk, t_tensor, cond_emb, layer_mask, drop_mask=drop_mask_cond)
+            # For CFG: get predictions without condition (drop_mask=True drops the condition)
+            drop_mask_uncond = torch.ones(B, dtype=torch.bool, device=device)
+            eps_uncond_mat, eps_uncond_thk = self.model(x, x_thk, t_tensor, cond_emb, layer_mask, drop_mask=drop_mask_uncond)
+            # Apply classifier-free guidance
             eps_mat = (1.0 + guidance_w) * eps_cond_mat - guidance_w * eps_uncond_mat
             eps_thk = (1.0 + guidance_w) * eps_cond_thk - guidance_w * eps_uncond_thk
 
