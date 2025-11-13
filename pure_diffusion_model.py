@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-# enhanced_diffusion_model_fixed_gradible.py
+# pure_diffusion_model.py
 """
-Fixed enhanced diffusion training script (gradients preserved through PNN)
+Pure Diffusion-based Inverse Design for Optical Multilayer Structures
 
-Key fixes:
- - No more torch.no_grad / detach around PNN predictions.
- - PNN parameters are frozen (requires_grad=False) but gradient can flow through its outputs.
- - Per-sample classifier-free masking implemented.
- - Correct x0 reconstruction using scheduler.alphas_cumprod with t in 1..T.
- - Timesteps sampling corrected to 1..T inclusive.
- - Added optional gradient debug prints (--grad_debug) to inspect requires_grad flags.
- - Provided TODO notes for hooking real PNN/TMM/Processor implementations.
+This script implements a conditional diffusion model for inverse design WITHOUT PNN.
+The model learns to generate material sequences and thicknesses conditioned on target spectra.
+
+Key Design Principles:
+1. Pure diffusion: Only denoising loss, no auxiliary physics loss
+2. Conditional generation: Target spectra embedded as condition via trainable encoder
+3. Classifier-free guidance: Enable flexible sampling control
+4. Standard DDPM scheduler: Proven noise schedule
+
+Architecture:
+- Input: Noisy material probabilities + thicknesses + timestep + spectrum condition
+- Output: Predicted noise (epsilon prediction)
+- Loss: MSE between predicted and true noise
 
 Usage:
-  python enhanced_diffusion_model_fixed_gradible.py --data optimized_dataset/optimized_multilayer_dataset.npz --pnn pnn_final.pt
+    python pure_diffusion_model.py --data optimized_dataset/optimized_multilayer_dataset.npz --epochs 100 --batch 128
 """
 
 import os
@@ -27,7 +32,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 from tqdm import tqdm
-from pnn import PNNTransformer, PNNMLP
 
 # ---------------------------
 # Placeholder adapters (replace with your actual implementations if available)
@@ -232,145 +236,60 @@ class EnhancedDiffusionUNet(nn.Module):
         return mat_noise, thk_noise
 
 # ---------------------------
-# PNN surrogate loader (expects you have a pnn.py or state dict)
+# Pure Diffusion Model - No PNN required
 # ---------------------------
-
-class PNNSurrogateWrapper(nn.Module):
-    """
-    Wrapper to load an external PNN (either state_dict or full model).
-    We expect PNN.forward(mat_idx, thickness_norm, mask) -> (B, S) or (B, 2S)
-    """
-    def __init__(self, pnn_path=None, device='cpu', current_vocab=None):
-        super().__init__()
-        self.pnn = None
-        self.device = device
-        self.pnn_vocab = None
-        self.reorder_idx = None  # mapping from pnn_vocab order to current_vocab order
-        if pnn_path is not None and os.path.exists(pnn_path):
-            # TODO: adapt this to your PNN class definition if needed.
-            # We try to load a full model first, else a state_dict into a default architecture.
-            try:
-                loaded = torch.load(pnn_path, map_location=device)
-                if isinstance(loaded, dict) and 'model_state' in loaded:
-                    # user-supplied checkpoint with metadata; reconstruct Transformer model
-                    spectrum_dim = loaded.get('spectrum_dim', None)
-                    vocab = loaded.get('vocab', None)
-                    max_layers = loaded.get('max_layers', None)
-                    emb_dim = loaded.get('emb_dim', 128)
-                    n_heads = loaded.get('n_heads', 4)
-                    n_encoder_layers = loaded.get('n_encoder_layers', 3)
-                    mlp_hidden = loaded.get('mlp_hidden', 256)
-                    dropout = loaded.get('dropout', 0.1)
-                    use_sigmoid = loaded.get('use_sigmoid', False)
-                    use_position_encoding = loaded.get('use_position_encoding', True)
-                    separate_TR = loaded.get('separate_TR', False)
-                    if spectrum_dim is not None and vocab is not None and max_layers is not None:
-                        self.pnn_vocab = list(vocab)
-                        self.pnn = PNNTransformer(
-                            vocab_size=len(vocab), max_layers=max_layers, spectrum_dim=spectrum_dim,
-                            emb_dim=emb_dim, n_heads=n_heads, n_encoder_layers=n_encoder_layers,
-                            mlp_hidden=mlp_hidden, dropout=dropout, use_sigmoid=use_sigmoid,
-                            use_position_encoding=use_position_encoding, separate_TR=separate_TR
-                        )
-                        self.pnn.load_state_dict(loaded['model_state'])
-                    else:
-                        # maybe the file directly contains model
-                        if isinstance(loaded, nn.Module):
-                            self.pnn = loaded
-                        else:
-                            print("[PNN] checkpoint missing necessary metadata; unable to instantiate model.")
-                elif isinstance(loaded, nn.Module):
-                    self.pnn = loaded
-                else:
-                    # maybe user saved entire model via torch.save(model)
-                    try:
-                        model = loaded
-                        self.pnn = model
-                    except Exception:
-                        self.pnn = None
-            except Exception as e:
-                print("[PNN] Failed to auto-load PNN: ", e)
-                self.pnn = None
-        else:
-            if pnn_path:
-                print(f"[PNN] pnn_path {pnn_path} not found; continuing without PNN.")
-        if self.pnn is not None:
-            self.pnn.to(device)
-            # freeze PNN parameters but allow gradients to flow through its outputs
-            for p in self.pnn.parameters():
-                p.requires_grad = False
-            self.pnn.eval()
-            # build reorder mapping if vocab provided
-            if self.pnn_vocab is not None and current_vocab is not None:
-                try:
-                    perm = []
-                    current_index = {m: i for i, m in enumerate(current_vocab)}
-                    for m in self.pnn_vocab:
-                        perm.append(current_index.get(m, current_index.get('VOID', 0)))
-                    self.reorder_idx = torch.tensor(perm, dtype=torch.long)
-                except Exception as e:
-                    print("[PNN] failed to build vocab reorder mapping:", e)
-
-    def predict_from_probs(self, materials_probs, thickness_norm, mask):
-        """
-        Differentiable bridge between diffusion output (probabilities)
-        and PNN input (indices).
-        """
-        if self.pnn is None:
-            raise RuntimeError("PNN surrogate not loaded.")
-
-        # 1️⃣ 计算 soft embedding (保留梯度)
-        emb_layer = getattr(self.pnn, "mat_emb", None)
-        if emb_layer is None:
-            raise RuntimeError("PNN has no mat_emb embedding layer.")
-        # reorder materials_probs to match pnn vocab order if needed
-        if self.reorder_idx is not None:
-            idx = self.reorder_idx.to(materials_probs.device)
-            materials_probs = torch.index_select(materials_probs, dim=-1, index=idx)
-        emb_weight = emb_layer.weight  # (V, D)
-        soft_emb = torch.einsum("blv,vd->bld", materials_probs, emb_weight)  # (B,L,D)
-
-        # 2️⃣ 直接调用 pnn.forward()（现在它能接受 soft embedding）
-        out = self.pnn(soft_emb, thickness_norm, mask)
-
-        # 3️⃣ 不做 detach、不做 no_grad
-        return out
 # ---------------------------
 # Full Diffusion model wrapper
 # ---------------------------
 
-class EnhancedDiffusionModel:
-    def __init__(self, device='cuda', data_path=None, pnn_path=None):
+class PureDiffusionModel:
+    def __init__(self, device='cuda', data_path=None, hidden_dim=256, lr=1e-4):
         self.device = torch.device(device if torch.cuda.is_available() and device.startswith('cuda') else 'cpu')
-        print("[device]", self.device)
-        assert data_path is not None and os.path.exists(data_path), "Provide valid data file."
-        ds = MultilayerDataset(data_path)
-        self.ds = ds
-        self.scheduler = NoiseScheduler(T=1000, beta_start=1e-4, beta_end=0.02, device=self.device)
-        self.layer_count = ds.max_layers
-        self.vocab_size = ds.vocab_size
-        self.spectrum_dim = ds.S
-        self.model = EnhancedDiffusionUNet(self.layer_count, self.vocab_size, hidden_dim=256).to(self.device)
-        self.pnn_wrapper = PNNSurrogateWrapper(pnn_path, device=self.device) if pnn_path else None
+        print(f"[Device] {self.device}")
         
-        # Create spectrum encoder as a proper model component (trainable)
+        # Load dataset
+        assert data_path is not None and os.path.exists(data_path), "Provide valid data file."
+        self.ds = MultilayerDataset(data_path)
+        
+        # Initialize scheduler
+        self.scheduler = NoiseScheduler(T=1000, beta_start=1e-4, beta_end=0.02, device=self.device)
+        
+        # Model parameters
+        self.layer_count = self.ds.max_layers
+        self.vocab_size = self.ds.vocab_size
+        self.spectrum_dim = self.ds.S
+        
+        # Build model
+        self.model = EnhancedDiffusionUNet(
+            layer_count=self.layer_count,
+            vocab_size=self.vocab_size,
+            hidden_dim=hidden_dim
+        ).to(self.device)
+        
+        # Spectrum encoder (trainable)
         self.spec_encoder = nn.Sequential(
-            nn.LayerNorm(ds.S * 2),
-            nn.Linear(ds.S * 2, 256),
+            nn.LayerNorm(self.ds.S * 2),
+            nn.Linear(self.ds.S * 2, 256),
             nn.SiLU(),
             nn.Linear(256, 128)
         ).to(self.device)
         
-        # Optimizer includes both model and spectrum encoder parameters
-        model_params = list(self.model.parameters()) + list(self.spec_encoder.parameters())
-        self.optimizer = torch.optim.AdamW(model_params, lr=1e-4)
-        self.ema = {n: p.detach().clone() for n,p in self.model.named_parameters() if p.requires_grad}
+        # Optimizer (includes both model and encoder)
+        all_params = list(self.model.parameters()) + list(self.spec_encoder.parameters())
+        self.optimizer = torch.optim.AdamW(all_params, lr=lr, weight_decay=1e-6)
+        
+        # EMA for stable sampling
+        self.ema = {n: p.detach().clone().cpu() for n,p in self.model.named_parameters() if p.requires_grad}
         self.ema_decay = 0.9999
-        # hyperparams
-        self.p_uncond = 0.1
-        self.lambda_spec = 1.0
-        self.lambda_phys = 0.1
-        self.guidance_w = 6.0
+        
+        # Hyperparameters
+        self.p_uncond = 0.1  # Probability of dropping condition during training
+        self.guidance_w = 6.0  # Classifier-free guidance weight for sampling
+        
+        # Learning rate scheduler
+        self.scheduler_lr = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=100, eta_min=1e-6
+        )
 
     def _encode_spectrum(self, spectra):
         # Encode spectrum using trainable spectrum encoder
@@ -378,12 +297,10 @@ class EnhancedDiffusionModel:
         return self.spec_encoder(spectra.to(self.device))
 
     def _update_ema(self):
-        for n,p in self.model.named_parameters():
+        """Update EMA parameters (kept on CPU to save memory)."""
+        for n, p in self.model.named_parameters():
             if p.requires_grad:
-               # 修改后
-                self.ema[n] = self.ema[n].to(p.device)
-                self.ema[n].mul_(self.ema_decay).add_(p.detach(), alpha=1.0 - self.ema_decay)
-               #self.ema[n].mul_(self.ema_decay).add_(p.detach().cpu(), alpha=1.0 - self.ema_decay)
+                self.ema[n].mul_(self.ema_decay).add_(p.detach().cpu(), alpha=1.0 - self.ema_decay)
 
     def _apply_ema(self):
         # save current and apply ema
@@ -410,7 +327,7 @@ class EnhancedDiffusionModel:
         x0_thk = (x_t_thk - sqrt_1m * pred_thk_noise) / (sqrt_alpha_bar + 1e-12)
         return x0_mat, x0_thk
 
-    def train_step(self, batch, lambda_spec_scale: float = 1.0, grad_debug: bool = False):
+    def train_step(self, batch, grad_debug=False):
         mat_idx, thickness_norm, layer_mask, target = batch
         mat_idx = mat_idx.to(self.device)
         thickness_norm = thickness_norm.to(self.device)
@@ -453,43 +370,31 @@ class EnhancedDiffusionModel:
         materials_probs_hat = F.softmax(x0_mat_hat, dim=-1)  # (B,L,V)
         thickness_hat = torch.clamp(x0_thk_hat, 0.0, 1.0)  # (B,L,1) stay within normalized range
 
-        # Use PNN surrogate to compute predicted spectra.
-        # CRITICAL: Do NOT wrap this call in torch.no_grad() or detach(); we WANT gradients to flow.
-        spec_loss_val = 0.0
-        phys_loss_val = 0.0
-        if self.pnn_wrapper is not None and self.pnn_wrapper.pnn is not None:
-            # ensure PNN parameters are frozen but outputs are differentiable
-            # NOTE: PNNSurrogateWrapper already sets p.requires_grad = False for p in pnn.parameters()
-            pred_spectra = self.pnn_wrapper.predict_from_probs(materials_probs_hat, thickness_hat, layer_mask)
-            # pred_spectra should be tensor (B, 2S)
-            # compute L1 or MSE loss
-            spec_loss = F.l1_loss(pred_spectra, target)
-            spec_loss_val = spec_loss.item() if not grad_debug else spec_loss.detach().cpu().item()
-            # (optional) physics constraint loss could be added; simple form:
-            # energy conservation penalty: max(0, T+R-1)
-            S = self.spectrum_dim
-            pred_T = pred_spectra[:, :S]
-            pred_R = pred_spectra[:, S:]
-            cons_violation = F.relu(pred_T + pred_R - 1.0).mean()
-            phys_loss = cons_violation
-            phys_loss_val = phys_loss.item() if not grad_debug else phys_loss.detach().cpu().item()
-        else:
-            # no surrogate: skip spec loss (or you may compute PNN offline)
-            spec_loss = torch.tensor(0.0, device=self.device)
-            phys_loss = torch.tensor(0.0, device=self.device)
+        # Pure diffusion: only noise loss, no PNN or physics loss
+        loss_mat = F.mse_loss(pred_mat_noise, eps_mat)
+        loss_thk = F.mse_loss(pred_thk_noise, eps_thk)
+        total_loss = loss_mat + loss_thk
+        
+        # Compute metrics for monitoring (no gradient)
+        with torch.no_grad():
+            # Material prediction accuracy
+            mat_pred = torch.argmax(x0_mat_hat, dim=-1)
+            mat_acc = (mat_pred == mat_idx).float().mean()
+            
+            # Thickness MAE
+            thk_mae = torch.abs(x0_thk_hat.squeeze(-1) - thickness.squeeze(-1)).mean()
 
-        # total loss
-        total_loss = loss_noise + (self.lambda_spec * lambda_spec_scale) * spec_loss + self.lambda_phys * phys_loss
-
-        # Debug: check requires_grad flags for critical tensors (only if asked)
         if grad_debug:
-            print("DEBUG grad flags:")
-            print("  loss_noise.requires_grad:", loss_noise.requires_grad)
-            print("  spec_loss.requires_grad:", spec_loss.requires_grad)
-            print("  total_loss.requires_grad:", total_loss.requires_grad)
-            print("  pred_spectra.requires_grad (if present):", pred_spectra.requires_grad if 'pred_spectra' in locals() else "N/A")
-            print("  materials_probs_hat.requires_grad:", materials_probs_hat.requires_grad)
-            print("  x0_mat_hat.requires_grad:", x0_mat_hat.requires_grad)
+            print("=" * 60)
+            print("GRADIENT DEBUG INFO")
+            print("=" * 60)
+            print(f"  total_loss.requires_grad: {total_loss.requires_grad}")
+            print(f"  loss_mat.requires_grad: {loss_mat.requires_grad}")
+            print(f"  loss_thk.requires_grad: {loss_thk.requires_grad}")
+            print(f"  pred_mat_noise.requires_grad: {pred_mat_noise.requires_grad}")
+            print(f"  x_t_mat.requires_grad: {x_t_mat.requires_grad}")
+            print(f"  cond_emb.requires_grad: {cond_emb.requires_grad}")
+            print("=" * 60)
 
         # backward & step
         self.optimizer.zero_grad()
@@ -497,33 +402,21 @@ class EnhancedDiffusionModel:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
-        # ema update (on CPU copy for memory safety)
+        # Update EMA
         self._update_ema()
-
-        # r2 metric for monitoring if surrogate available
-        r2_val = 0.0
-        if self.pnn_wrapper is not None and self.pnn_wrapper.pnn is not None:
-            with torch.no_grad():
-                y_true = target
-                y_pred = pred_spectra
-                y_mean = y_true.mean(dim=1, keepdim=True)
-                ss_tot = ((y_true - y_mean) ** 2).sum(dim=1)
-                ss_res = ((y_true - y_pred) ** 2).sum(dim=1)
-                r2_batch = 1.0 - (ss_res / (ss_tot + 1e-12))
-                r2_val = float(r2_batch.mean().detach().cpu())
-
+        
         metrics = {
             'loss': float(total_loss.detach().cpu()),
-            'noise': float(loss_noise.detach().cpu()),
-            'spec': float(spec_loss.detach().cpu()) if hasattr(spec_loss, 'detach') else float(spec_loss),
-            'phys': float(phys_loss.detach().cpu()) if hasattr(phys_loss, 'detach') else float(phys_loss),
-            'r2': r2_val
+            'loss_mat': float(loss_mat.detach().cpu()),
+            'loss_thk': float(loss_thk.detach().cpu()),
+            'mat_acc': float(mat_acc.cpu()),
+            'mae_thk': float(thk_mae.cpu())
         }
         return metrics
 
     @torch.no_grad()
     def eval_step(self, batch):
-        """Validation forward without weight updates. Returns spec loss and r2 if surrogate is present."""
+        """Validation forward without weight updates."""
         mat_idx, thickness_norm, layer_mask, target = batch
         mat_idx = mat_idx.to(self.device)
         thickness_norm = thickness_norm.to(self.device)
@@ -544,26 +437,23 @@ class EnhancedDiffusionModel:
         cond_emb = self._encode_spectrum(target)
         pred_mat_noise, pred_thk_noise = self.model(x_t_mat, x_t_thk, timesteps, cond_emb, layer_mask, drop_mask)
 
-        x0_mat_hat, x0_thk_hat = self._reconstruct_x0(x_t_mat, x_t_thk, pred_mat_noise, pred_thk_noise, timesteps)
-        materials_probs_hat = F.softmax(x0_mat_hat, dim=-1)
-        thickness_hat = torch.clamp(x0_thk_hat, 0.0, 1.0)
+        # Compute validation loss
+        loss_mat = F.mse_loss(pred_mat_noise, eps_mat)
+        loss_thk = F.mse_loss(pred_thk_noise, eps_thk)
+        total_loss = loss_mat + loss_thk
 
-        spec_loss = torch.tensor(0.0, device=self.device)
-        r2_val = 0.0
-        if self.pnn_wrapper is not None and self.pnn_wrapper.pnn is not None:
-            pred_spectra = self.pnn_wrapper.predict_from_probs(materials_probs_hat, thickness_hat, layer_mask)
-            spec_loss = F.l1_loss(pred_spectra, target)
-            y_true = target
-            y_pred = pred_spectra
-            y_mean = y_true.mean(dim=1, keepdim=True)
-            ss_tot = ((y_true - y_mean) ** 2).sum(dim=1)
-            ss_res = ((y_true - y_pred) ** 2).sum(dim=1)
-            r2_batch = 1.0 - (ss_res / (ss_tot + 1e-12))
-            r2_val = float(r2_batch.mean().detach().cpu())
+        # Reconstruct for metrics
+        x0_mat_hat, x0_thk_hat = self._reconstruct_x0(x_t_mat, x_t_thk, pred_mat_noise, pred_thk_noise, timesteps)
+        mat_pred = torch.argmax(x0_mat_hat, dim=-1)
+        mat_acc = (mat_pred == mat_idx).float().mean()
+        thk_mae = torch.abs(x0_thk_hat.squeeze(-1) - thickness.squeeze(-1)).mean()
 
         return {
-            'spec': float(spec_loss.detach().cpu()),
-            'r2': r2_val
+            'loss': float(total_loss.detach().cpu()),
+            'loss_mat': float(loss_mat.detach().cpu()),
+            'loss_thk': float(loss_thk.detach().cpu()),
+            'mat_acc': float(mat_acc.cpu()),
+            'mae_thk': float(thk_mae.cpu())
         }
 
     @torch.no_grad()
@@ -634,11 +524,9 @@ class EnhancedDiffusionModel:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--data', required=True, help='path to optimized_dataset .npz')
-    p.add_argument('--pnn', required=False, default='pnn_best.pt', help='path to pnn checkpoint (optional). If provided, will be loaded')
     p.add_argument('--epochs', type=int, default=200)
     p.add_argument('--batch', type=int, default=128)
     p.add_argument('--lr', type=float, default=1e-4)
-    p.add_argument('--spec_warmup_epochs', type=int, default=20, help='epochs to anneal spectral loss weighting from 0->1')
     p.add_argument('--guidance', type=float, default=6.0)
     p.add_argument('--grad_debug', action='store_true', help='print grad debug info for first batch')
     p.add_argument('--device', default='cuda:0')
@@ -646,7 +534,7 @@ def parse_args():
 
 def train_model_cli(args):
     device = args.device
-    model = EnhancedDiffusionModel(device=device, data_path=args.data, pnn_path=args.pnn)
+    model = PureDiffusionModel(device=device, data_path=args.data, lr=args.lr)
     model.guidance_w = args.guidance
     # prepare dataloader
     ds = model.ds
@@ -662,35 +550,41 @@ def train_model_cli(args):
         model.model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
         epoch_loss = 0.0
-        # spectral loss annealing 0->1 over spec_warmup_epochs
-        lambda_scale = min(1.0, epoch / max(1, args.spec_warmup_epochs))
         for i, batch in enumerate(pbar):
             if args.grad_debug and epoch==1 and i==0:
-                metrics = model.train_step(batch, lambda_spec_scale=lambda_scale, grad_debug=True)
+                metrics = model.train_step(batch, grad_debug=True)
             else:
-                metrics = model.train_step(batch, lambda_spec_scale=lambda_scale, grad_debug=False)
+                metrics = model.train_step(batch, grad_debug=False)
             epoch_loss += metrics['loss'] * batch[0].shape[0]
-            pbar.set_postfix({'loss':metrics['loss'],'noise':metrics['noise'],'spec':metrics['spec'],'r2':metrics.get('r2',0.0)})
+            pbar.set_postfix({
+                'loss': f"{metrics['loss']:.4f}",
+                'mat_acc': f"{metrics['mat_acc']:.3f}",
+                'thk_mae': f"{metrics['mae_thk']:.4f}"
+            })
         epoch_loss = epoch_loss / len(train_ds)
+        
         # proper validation (no weight updates)
         model.model.eval()
-        val_spec = 0.0
-        val_r2 = 0.0
+        val_loss = 0.0
+        val_mat_acc = 0.0
+        val_thk_mae = 0.0
         n_val = 0
         for batch in val_loader:
             ev = model.eval_step(batch)
             bs = batch[0].shape[0]
-            val_spec += ev['spec'] * bs
-            val_r2 += ev['r2'] * bs
+            val_loss += ev['loss'] * bs
+            val_mat_acc += ev['mat_acc'] * bs
+            val_thk_mae += ev['mae_thk'] * bs
             n_val += bs
         if n_val > 0:
-            val_spec /= n_val
-            val_r2 /= n_val
-        print(f"Epoch {epoch} finished. train loss: {epoch_loss:.6f} | val spec L1: {val_spec:.6f} | val r2: {val_r2:.4f}")
-        if val_spec < best_val:
-            best_val = val_spec
-            torch.save({'model_state': model.model.state_dict()}, 'enhanced_diffusion_best.pt')
-            print("Saved best diffusion model: enhanced_diffusion_best.pt")
+            val_loss /= n_val
+            val_mat_acc /= n_val
+            val_thk_mae /= n_val
+        print(f"Epoch {epoch} finished. train loss: {epoch_loss:.6f} | val loss: {val_loss:.6f} | val mat_acc: {val_mat_acc:.3f} | val thk_mae: {val_thk_mae:.4f}")
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save({'model_state': model.model.state_dict()}, 'pure_diffusion_best.pt')
+            print("Saved best diffusion model: pure_diffusion_best.pt")
         history.append(epoch_loss)
     print("Training finished.")
     return model, history
@@ -699,5 +593,5 @@ if __name__ == '__main__':
     args = parse_args()
     model, history = train_model_cli(args)
     # Optionally save final model
-    torch.save({'model_state': model.model.state_dict()}, 'enhanced_diffusion_model_final.pt')
-    print("Saved final model: enhanced_diffusion_model_final.pt")
+    torch.save({'model_state': model.model.state_dict()}, 'pure_diffusion_model_final.pt')
+    print("Saved final model: pure_diffusion_model_final.pt")
